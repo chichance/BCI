@@ -1,0 +1,182 @@
+#!/usr/bin/env python3
+"""
+-------------------------------------------------------------------------------
+AUTHOR: Chance Joaquin Boone
+TITLE: Chief Software Engineer, Beacon Computing Initiative
+LOCATION: Albuquerque, New Mexico
+DESCRIPTION: Automated Secure Process Enforcer with Fernet Propagation
+-------------------------------------------------------------------------------
+"""
+
+import os
+import sys
+import time
+import json
+import logging
+import subprocess
+import psutil
+from datetime import datetime
+from cryptography.fernet import Fernet, InvalidToken
+
+# --- CONFIGURATION (Hardcoded - No flags required) ---
+DENYLIST_FILE    = "process_denylist.json"
+ENFORCE_LOG      = "enforcement.log"
+CPU_THRESHOLD    = 0.003   # CPU % threshold to flag a process
+SCAN_INTERVAL    = 60      # Seconds between scans
+ENFORCE_INTERVAL = 180     # Seconds between enforcement actions (3 mins)
+ENFORCE_ACTION   = "kill"  # Options: "kill" or "warn"
+
+# --- WHITELIST ---
+# Protects your primary script name, python interpreter, and the Beacon infrastructure.
+WHITELIST = ["6.py", "python3", "secure_auto_enforcer.py", "gen_"]
+
+# Fernet Propagation Config
+GENERATION  = int(os.environ.get("FERNET_GEN", "0"))
+MAX_GEN     = int(os.environ.get("FERNET_MAX", "1")) 
+PARENT_KEY  = os.environ.get("FERNET_KEY", "")
+AUTH_TOKEN  = os.environ.get("FERNET_TOKEN", "")
+PASSPHRASE  = b"beacon_initiative_auth_run"
+
+# --- LOGGING ---
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [GEN %(gen)s] %(message)s",
+    handlers=[logging.FileHandler(ENFORCE_LOG), logging.StreamHandler(sys.stdout)],
+)
+log = logging.LoggerAdapter(logging.getLogger("beacon_enforcer"), {'gen': GENERATION})
+
+# --- SECURITY & PROPAGATION ---
+
+def verify_and_propagate():
+    """Verifies parent identity and spawns one child before starting work."""
+    if GENERATION > 0:
+        if not PARENT_KEY or not AUTH_TOKEN:
+            log.error("Authentication Failed: Missing Credentials.")
+            sys.exit(1)
+        try:
+            f = Fernet(PARENT_KEY.encode())
+            if f.decrypt(AUTH_TOKEN.encode()) != PASSPHRASE:
+                raise InvalidToken
+            log.info("Beacon Identity Verified.")
+        except InvalidToken:
+            log.error("Authentication Failed: Invalid Signature.")
+            sys.exit(1)
+
+    if GENERATION < MAX_GEN:
+        try:
+            source = open(__file__, "rb").read()
+            key = Fernet.generate_key()
+            f = Fernet(key)
+            token = f.encrypt(PASSPHRASE).decode()
+            
+            child_name = os.path.join(os.path.dirname(os.path.abspath(__file__)), f"gen_{GENERATION+1}_node.py")
+            with open(child_name, "wb") as f_out:
+                f_out.write(source)
+
+            env = {
+                **os.environ,
+                "FERNET_GEN": str(GENERATION + 1),
+                "FERNET_KEY": key.decode(),
+                "FERNET_TOKEN": token
+            }
+            log.info(f"Propagating Beacon Node to Gen {GENERATION + 1}...")
+            subprocess.Popen([sys.executable, child_name], env=env)
+        except Exception as e:
+            log.error(f"Propagation Error: {e}")
+
+# --- ENFORCEMENT & MONITORING ---
+
+def run_scan():
+    """Identifies resource-heavy processes while respecting the 6.py whitelist."""
+    denylist = {}
+    if os.path.exists(DENYLIST_FILE):
+        try:
+            with open(DENYLIST_FILE, "r") as f: denylist = json.load(f)
+        except: pass
+
+    # Prime CPU counters
+    for p in psutil.process_iter(['name']):
+        try: p.cpu_percent(None)
+        except: pass
+    
+    time.sleep(1.0) # Sample window
+    
+    new_flags = 0
+    for p in psutil.process_iter(['pid', 'name', 'cmdline']):
+        try:
+            cpu = p.cpu_percent(None)
+            name = p.info['name'] or ""
+            cmdline = " ".join(p.info['cmdline'] if p.info['cmdline'] else [])
+
+            # Safety check: Do not flag 6.py or whitelisted items
+            if any(protected in cmdline or protected in name for protected in WHITELIST):
+                continue
+
+            if cpu > CPU_THRESHOLD:
+                if name not in denylist:
+                    denylist[name] = {
+                        "first_seen": datetime.now().isoformat(), 
+                        "peak_cpu": cpu,
+                        "status": "flagged"
+                    }
+                    new_flags += 1
+                else:
+                    denylist[name]["peak_cpu"] = max(denylist[name]["peak_cpu"], cpu)
+        except (psutil.NoSuchProcess, psutil.AccessDenied): pass
+
+    with open(DENYLIST_FILE, "w") as f:
+        json.dump(denylist, f, indent=2)
+    
+    if new_flags > 0:
+        log.info(f"Scan complete. Added {new_flags} new signatures to denylist.")
+
+def run_enforcement():
+    """Terminates processes in denylist, strictly ignoring whitelisted files."""
+    if not os.path.exists(DENYLIST_FILE): return
+    try:
+        with open(DENYLIST_FILE, "r") as f: denylist = json.load(f)
+    except: return
+
+    for p in psutil.process_iter(['pid', 'name', 'cmdline']):
+        try:
+            name = p.info['name'] or ""
+            cmdline = " ".join(p.info['cmdline'] if p.info['cmdline'] else [])
+            
+            # Whitelist override: 6.py is immune
+            if any(protected in cmdline or protected in name for protected in WHITELIST):
+                continue
+
+            if name in denylist:
+                if ENFORCE_ACTION == "kill":
+                    p.kill()
+                    log.warning(f"TERMINATED: {name} (Beacon Policy Enforcement)")
+                else:
+                    log.warning(f"POLICY VIOLATION: {name} exceeds resource limits.")
+        except (psutil.NoSuchProcess, psutil.AccessDenied): pass
+
+# --- OPERATIONAL LOOP ---
+
+if __name__ == "__main__":
+    # 1. Validate credentials and propagate
+    verify_and_propagate()
+    
+    # 2. Continuous automated cycle
+    last_scan = 0
+    last_enforce = 0
+    
+    log.info("Beacon Computing Initiative Enforcer operational.")
+    try:
+        while True:
+            now = time.time()
+
+            if now - last_scan > SCAN_INTERVAL:
+                run_scan()
+                last_scan = now
+
+            if now - last_enforce > ENFORCE_INTERVAL:
+                run_enforcement()
+                last_enforce = now
+
+            time.sleep(5)
+    except KeyboardInterrupt:
+        log.info("Beacon Enforcer shutting down.")
