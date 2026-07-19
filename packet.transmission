@@ -1,0 +1,67 @@
+#!/usr/bin/env python3
+"""
+BCI Network Transmission Utility
+Part of the Beacon Computing Initiative Framework
+Author: Chance Joaquin Boone
+"""
+import os
+import sys
+import argparse
+from scapy.all import IP, UDP, Raw, send
+
+def bci_stream_payload(file_path, target_ip, target_port, chunk_size=1400):
+    if not os.path.exists(file_path):
+        print(f"[BCI-ERR] Target object '{file_path}' unresolved in current workspace.")
+        sys.exit(1)
+        
+    file_size = os.path.getsize(file_path)
+    total_packets = (file_size + chunk_size - 1) // chunk_size
+    
+    print(f"[BCI-INIT] Initializing payload transmission: {file_path}")
+    print(f"[BCI-STAT] Allocation: {file_size} bytes | Structural Segments: {total_packets}")
+    print(f"[BCI-DEST] Target Endpoint: {target_ip}:{target_port}\n")
+    print(f"[BCI-AUTH] Operator Signature: Chance Joaquin Boone\n")
+
+    sent_bytes = 0
+    packet_count = 0
+
+    try:
+        with open(file_path, "rb") as f:
+            while True:
+                chunk = f.read(chunk_size)
+                if not chunk:
+                    break
+                
+                packet_count += 1
+                sent_bytes += len(chunk)
+                
+                # Construct BCI network layer boundaries
+                packet = IP(dst=target_ip) / UDP(sport=5001, dport=target_port) / Raw(load=chunk)
+                
+                # Execute stateless layer 3 packet injection
+                send(packet, verbose=False)
+                
+                # Live network pipeline telemetry tracking
+                percent = (sent_bytes / file_size) * 100
+                telemetry_str = f"\r[BCI-TX] Dispatched segment {packet_count}/{total_packets} ({percent:.1f}%) - {sent_bytes}/{file_size} bytes"
+                sys.stdout.write(telemetry_str.ljust(85))
+                sys.stdout.flush()
+                
+        print("\n\n[BCI-SUCCESS] Pipeline transmission verified. All data frames dispatched.")
+        
+    except KeyboardInterrupt:
+        print("\n\n[BCI-ABORT] Data stream terminated via operator override.")
+        sys.exit(1)
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(
+        description="BCI Core Utility: Stream compiled node binaries or files over explicit UDP boundaries using Scapy."
+    )
+    parser.add_argument("file", help="Path to the node payload target")
+    parser.add_argument("ip", help="Target node destination IP address")
+    parser.add_argument("port", type=int, help="Target node communication port")
+    parser.add_argument("--size", type=int, default=1400, help="Payload frame segment size limit (Default: 1400)")
+    
+    args = parser.parse_args()
+    
+    bci_stream_payload(args.file, args.ip, args.port, args.size)
